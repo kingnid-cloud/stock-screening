@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════╗
+║   LIVE WATCHLIST TERMINAL  —  Local Server               ║
+║   Fetches real-time data from Yahoo Finance server-side  ║
+╠══════════════════════════════════════════════════════════╣
+║  SETUP (one time):                                       ║
+║    pip install yfinance                                  ║
+║                                                          ║
+║  RUN:                                                    ║
+║    python watchlist_server.py                            ║
+║                                                          ║
+║  Then open your browser to:                              ║
+║    http://localhost:8080                                 ║
+╚══════════════════════════════════════════════════════════╝
+"""
+
+import http.server
+import json
+import urllib.parse
+import threading
+import sys
+import os
+import time
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("\n❌  yfinance not found.\n")
+    print("    Run:  pip install yfinance\n")
+    sys.exit(1)
+
+PORT = 8080
+
+# ─────────────────────────────────────────────────────────
+#  DATA FETCHER
+# ─────────────────────────────────────────────────────────
+
+def fetch_quotes(symbols):
+    """Fetch live quotes + fundamentals for a list of symbols."""
+    results = []
+    # yfinance batch download for price/day data
+    try:
+        tickers = yf.Tickers(" ".join(symbols))
+    except Exception as e:
+        print(f"  [error] yf.Tickers failed: {e}")
+        return []
+
+    for sym in symbols:
+        try:
+            t = tickers.tickers.get(sym)
+            if not t:
+                t = yf.Ticker(sym)
+            info = t.fast_info  # fast — price, volume, 52w
+            full = t.info       # full fundamentals
+
+            price = getattr(info, "last_price", None) or full.get("regularMarketPrice") or full.get("currentPrice")
+            prev  = getattr(info, "previous_close", None) or full.get("previousClose")
+            chg_pct = ((price - prev) / prev * 100) if price and prev else None
+
+            hi52 = getattr(info, "year_high", None) or full.get("fiftyTwoWeekHigh")
+            lo52 = getattr(info, "year_low",  None) or full.get("fiftyTwoWeekLow")
+            ma50  = full.get("fiftyDayAverage")
+            ma200 = full.get("twoHundredDayAverage")
+
+            rec_mean = full.get("recommendationMean")   # 1=strong buy … 5=strong sell
+            pt_mean  = full.get("targetMeanPrice")
+            pt_high  = full.get("targetHigh") or full.get("targetHighPrice")
+            pt_low   = full.get("targetLow")  or full.get("targetLowPrice")
+            n_analysts = full.get("numberOfAnalystOpinions", 0) or full.get("recommendationKey", 0)
+
+            row = {
+                "symbol":     sym,
+                "name":       full.get("longName") or full.get("shortName") or sym,
+                "sector":     full.get("sector") or full.get("industry") or "—",
+                "currency":   full.get("currency", "USD"),
+                "price":      round(price, 4) if price else None,
+                "prevClose":  round(prev,  4) if prev  else None,
+                "changePct":  round(chg_pct, 4) if chg_pct else None,
+                "dayHigh":    full.get("dayHigh")  or full.get("regularMarketDayHigh"),
+                "dayLow":     full.get("dayLow")   or full.get("regularMarketDayLow"),
+                "volume":     full.get("volume")   or full.get("regularMarketVolume"),
+                "high52":     round(hi52,  2) if hi52  else None,
+                "low52":      round(lo52,  2) if lo52  else None,
+                "ma50":       round(ma50,  2) if ma50  else None,
+                "ma200":      round(ma200, 2) if ma200 else None,
+                "mktCap":     full.get("marketCap"),
+                "pe":         full.get("trailingPE"),
+                "fpe":        full.get("forwardPE"),
+                "pb":         full.get("priceToBook"),
+                "eps":        full.get("trailingEps"),
+                "epsF":       full.get("forwardEps"),
+                "roe":        round(full.get("returnOnEquity",0)*100, 2) if full.get("returnOnEquity") else None,
+                "roa":        round(full.get("returnOnAssets",0)*100, 2) if full.get("returnOnAssets") else None,
+                "grossMgn":   round(full.get("grossMargins",0)*100, 2)  if full.get("grossMargins")   else None,
+                "netMgn":     round(full.get("profitMargins",0)*100, 2) if full.get("profitMargins")  else None,
+                "opMgn":      round(full.get("operatingMargins",0)*100,2) if full.get("operatingMargins") else None,
+                "revGrow":    round(full.get("revenueGrowth",0)*100, 2) if full.get("revenueGrowth")  else None,
+                "epsGrow":    round(full.get("earningsGrowth",0)*100,2) if full.get("earningsGrowth") else None,
+                "dteq":       round(full.get("debtToEquity",0)/100, 3)  if full.get("debtToEquity")   else None,
+                "currRatio":  full.get("currentRatio"),
+                "divYield":   round(full.get("dividendYield",0)*100, 3) if full.get("dividendYield")  else None,
+                "ptMean":     round(pt_mean, 2) if pt_mean else None,
+                "ptHigh":     round(pt_high, 2) if pt_high else None,
+                "ptLow":      round(pt_low,  2) if pt_low  else None,
+                "recMean":    rec_mean,
+                "analystN":   n_analysts if isinstance(n_analysts, int) else 0,
+                "beta":       full.get("beta"),
+                "shortPct":   round(full.get("shortPercentOfFloat",0)*100,2) if full.get("shortPercentOfFloat") else None,
+            }
+            results.append(row)
+            print(f"  ✓ {sym:8s}  ${price:.2f}  {('+' if chg_pct and chg_pct>=0 else '')}{chg_pct:.2f}%" if price and chg_pct else f"  ✓ {sym}")
+        except Exception as e:
+            print(f"  ✗ {sym}: {e}")
+            results.append({"symbol": sym, "error": str(e)})
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────
+#  HTTP SERVER
+# ─────────────────────────────────────────────────────────
+
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass  # suppress default access log
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, html):
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+
+        # ── API: /api/quotes?symbols=AAPL,MSFT,... ──
+        if parsed.path == "/api/quotes":
+            qs = urllib.parse.parse_qs(parsed.query)
+            raw = qs.get("symbols", [""])[0]
+            symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+            if not symbols:
+                self.send_json({"error": "no symbols"}, 400)
+                return
+            print(f"\n[API] Fetching {len(symbols)} symbols: {', '.join(symbols[:8])}{'…' if len(symbols)>8 else ''}")
+            t0 = time.time()
+            data = fetch_quotes(symbols)
+            print(f"[API] Done in {time.time()-t0:.1f}s")
+            self.send_json({"results": data})
+
+        # ── Dashboard HTML ──
+        elif parsed.path in ("/", "/index.html"):
+            self.send_html(DASHBOARD_HTML)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+# ─────────────────────────────────────────────────────────
+#  DASHBOARD HTML  (served at http://localhost:8080)
+# ─────────────────────────────────────────────────────────
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Live Watchlist Terminal</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#030712;color:#cbd5e1;font-family:'Courier New',monospace;font-size:12px}
+#header{background:linear-gradient(135deg,#0d1b2e,#060f1c);border-bottom:2px solid #1e3a5f;padding:14px 20px}
+.h-row{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px}
+h1{font-size:17px;color:#06b6d4;letter-spacing:2px;font-weight:bold}
+.h-sub{font-size:10px;color:#475569;margin-top:3px;letter-spacing:1px}
+.h-right{text-align:right}
+.h-date{color:#22d3ee;font-size:13px;font-weight:bold}
+.h-ts{font-size:10px;color:#475569;margin-top:2px}
+#refbtn{margin-top:5px;padding:5px 16px;font-size:11px;cursor:pointer;background:#06b6d4;color:#000;border:none;border-radius:4px;font-family:inherit;font-weight:bold}
+#refbtn:disabled{opacity:.4;cursor:not-allowed}
+#progbar{height:3px;background:#1e293b;overflow:hidden;margin-top:8px;display:none}
+#progfill{height:100%;width:0;background:linear-gradient(90deg,#06b6d4,#00ff88);transition:width .3s}
+.legend{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap;font-size:10px}
+.dot{width:7px;height:7px;border-radius:1px;display:inline-block;margin-right:3px;vertical-align:middle}
+#addbar{background:#050d1a;border-bottom:1px solid #1e3a5f;padding:10px 20px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.add-label{font-size:11px;color:#475569;letter-spacing:1px;white-space:nowrap;font-weight:bold}
+#tickerinput{background:#0f172a;border:1px solid #1e3a5f;border-radius:5px;padding:7px 12px;color:#e2e8f0;font-size:13px;width:130px;outline:none;font-family:inherit;text-transform:uppercase;letter-spacing:1px}
+#tickerinput:focus{border-color:#06b6d4}
+#addbtn{padding:7px 18px;font-size:11px;cursor:pointer;background:#06b6d4;color:#000;border:none;border-radius:5px;font-family:inherit;font-weight:bold}
+#addbtn:hover{background:#22d3ee}
+#addbtn:disabled{opacity:.4;cursor:not-allowed}
+#addmsg{font-size:11px;min-width:180px}
+.preset-chips{display:flex;flex-wrap:wrap;gap:5px}
+.chip{padding:3px 9px;font-size:10px;background:#0f172a;border:1px solid #1e3a5f;border-radius:12px;cursor:pointer;color:#64748b;transition:all .15s}
+.chip:hover{border-color:#06b6d4;color:#06b6d4}
+#controls{padding:9px 20px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;border-bottom:1px solid #1e293b;background:#030810}
+#controls input,#controls select{background:#0f172a;border:1px solid #1e3a5f;border-radius:5px;padding:6px 10px;color:#cbd5e1;font-size:12px;outline:none;font-family:inherit}
+#controls input{width:180px}
+.tabgrp button{padding:5px 13px;font-size:11px;cursor:pointer;font-family:inherit;border:1px solid #1e3a5f;background:#0f172a;color:#64748b}
+.tabgrp button.active{background:#06b6d4;color:#000;font-weight:bold}
+.tabgrp button:first-child{border-radius:5px 0 0 5px}
+.tabgrp button:last-child{border-radius:0 5px 5px 0}
+#count{font-size:10px;color:#334155;margin-left:auto}
+#wrap{overflow-x:auto;padding-bottom:70px}
+table{width:100%;border-collapse:collapse;min-width:1900px}
+thead{position:sticky;top:0;background:#030810;z-index:10}
+th{padding:8px 10px;font-size:10px;color:#475569;border-bottom:1px solid #1e293b;cursor:pointer;user-select:none;white-space:nowrap;text-align:left}
+th:hover{color:#06b6d4}
+th.sorted{color:#06b6d4}
+td{padding:9px 10px;border-bottom:1px solid #0a1428;white-space:nowrap;vertical-align:middle}
+tr:nth-child(even){background:#040a14}
+tr:nth-child(odd){background:#030712}
+tr:hover{background:#071830!important}
+.sbadge{font-size:10px;padding:2px 7px;border-radius:10px;background:#0f172a;border:1px solid #1e293b;color:#64748b}
+.sbox{display:inline-flex;align-items:center;justify-content:center;width:40px;height:26px;border-radius:4px;font-weight:bold;font-size:13px}
+.vbadge{font-size:10px;font-weight:bold;padding:2px 8px;border-radius:4px}
+.pj{display:flex;flex-direction:column;align-items:center}
+.pj-s{font-size:13px;font-weight:bold}
+.pj-l{font-size:8px;color:#475569;letter-spacing:.5px}
+.abtn{background:none;border:1px solid;border-radius:3px;cursor:pointer;padding:2px 8px;font-size:10px;font-family:inherit;transition:all .15s}
+.an-btn{color:#22d3ee;border-color:#1e3a5f}.an-btn:hover{background:#22d3ee22}
+.rm-btn{color:#475569;border-color:#1e293b;margin-left:4px}.rm-btn:hover{color:#f87171;border-color:#f87171}
+#modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:100;align-items:center;justify-content:center;padding:20px}
+#modal-overlay.open{display:flex}
+#modal{background:#080f1e;border:1px solid #1e3a5f;border-radius:10px;width:100%;max-width:860px;max-height:90vh;overflow-y:auto}
+.mh{background:linear-gradient(135deg,#0d1e38,#060e1a);padding:18px 24px;border-bottom:1px solid #1e3a5f;border-radius:10px 10px 0 0;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;position:sticky;top:0;z-index:5}
+.m-tick{font-size:28px;font-weight:bold;letter-spacing:2px}
+.m-name{font-size:12px;color:#475569;margin-top:2px}
+.m-meta{font-size:10px;color:#334155;margin-top:3px}
+.m-price{font-size:28px;font-weight:bold;color:#f1f5f9}
+.m-chg{font-size:13px;margin-top:2px}
+.mclose{background:none;border:1px solid #334155;border-radius:5px;color:#64748b;cursor:pointer;padding:4px 12px;font-size:13px;font-family:inherit}
+.mclose:hover{border-color:#f87171;color:#f87171}
+.mb{padding:20px 24px}
+.ms{margin-bottom:22px}
+.ms h3{font-size:10px;color:#475569;letter-spacing:1.5px;margin-bottom:10px;border-bottom:1px solid #1e293b;padding-bottom:5px}
+.pc-row{display:flex;gap:12px;flex-wrap:wrap}
+.pc{flex:1;min-width:185px;background:#0d1a2e;border-radius:8px;padding:14px 16px}
+.pc-lbl{font-size:10px;color:#475569;letter-spacing:1px;margin-bottom:6px}
+.pc-num{font-size:36px;font-weight:bold;line-height:1}
+.pc-verd{font-size:12px;font-weight:bold;margin-top:4px}
+.pc-tgt{font-size:11px;color:#64748b;margin-top:5px}
+.pc-why{font-size:10px;color:#475569;margin-top:8px;line-height:1.6}
+.mg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.mi{background:#0a1628;border:1px solid #1e293b;border-radius:5px;padding:8px 12px}
+.mi-k{font-size:9px;color:#475569;letter-spacing:.8px}
+.mi-v{font-size:14px;font-weight:bold;color:#e2e8f0;margin-top:2px}
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:8px}
+.si{background:#0a1628;border:1px solid #1e293b;border-radius:5px;padding:8px 12px;display:flex;justify-content:space-between;align-items:center}
+.si-k{font-size:10px;color:#475569}.si-v{font-size:11px;font-weight:bold}
+.spin{display:inline-block;width:26px;height:26px;border:3px solid #1e293b;border-top-color:#06b6d4;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-box{text-align:center;padding:50px 20px;color:#475569;font-size:13px}
+#sbar{position:fixed;bottom:0;left:0;right:0;background:#040810;border-top:1px solid #1e3a5f;padding:6px 20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;z-index:20;font-size:10px}
+</style>
+</head>
+<body>
+<div id="header">
+  <div class="h-row">
+    <div>
+      <h1>◈ LIVE WATCHLIST &amp; RESEARCH TERMINAL</h1>
+      <div class="h-sub">REAL-TIME YAHOO FINANCE · 1M / 1Y / 5Y PROJECTION SCORES · ADD ANY TICKER · LOCAL SERVER</div>
+    </div>
+    <div class="h-right">
+      <div class="h-date" id="hdate"></div>
+      <div class="h-ts" id="hts">Connecting to local server…</div>
+      <button id="refbtn" onclick="refreshAll()">↻ REFRESH ALL</button>
+    </div>
+  </div>
+  <div id="progbar"><div id="progfill"></div></div>
+  <div class="legend">
+    <span><span class="dot" style="background:#00ff88"></span><span style="color:#00ff88;font-weight:bold">STRONG BUY</span> 8.5+</span>
+    <span><span class="dot" style="background:#22d3ee"></span><span style="color:#22d3ee;font-weight:bold">BUY</span> 7.5–8.4</span>
+    <span><span class="dot" style="background:#a3e635"></span><span style="color:#a3e635;font-weight:bold">WATCH+</span> 6.5–7.4</span>
+    <span><span class="dot" style="background:#fbbf24"></span><span style="color:#fbbf24;font-weight:bold">WATCH</span> 5.5–6.4</span>
+    <span><span class="dot" style="background:#fb923c"></span><span style="color:#fb923c;font-weight:bold">RISKY</span> 4–5.4</span>
+    <span><span class="dot" style="background:#f87171"></span><span style="color:#f87171;font-weight:bold">AVOID</span> &lt;4</span>
+  </div>
+</div>
+
+<div id="addbar">
+  <div class="add-label">+ ADD TICKER</div>
+  <input id="tickerinput" type="text" placeholder="e.g. TSLA" maxlength="12"
+    onkeydown="if(event.key==='Enter')addTicker()"
+    oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9.\-]/g,'')"/>
+  <button id="addbtn" onclick="addTicker()">ANALYZE &amp; ADD</button>
+  <span id="addmsg"></span>
+  <div class="preset-chips">
+    <span class="chip" onclick="quickAdd('TSLA')">TSLA</span>
+    <span class="chip" onclick="quickAdd('META')">META</span>
+    <span class="chip" onclick="quickAdd('AMD')">AMD</span>
+    <span class="chip" onclick="quickAdd('PLTR')">PLTR</span>
+    <span class="chip" onclick="quickAdd('ARM')">ARM</span>
+    <span class="chip" onclick="quickAdd('COIN')">COIN</span>
+    <span class="chip" onclick="quickAdd('SOFI')">SOFI</span>
+    <span class="chip" onclick="quickAdd('LLY')">LLY</span>
+    <span class="chip" onclick="quickAdd('ABBV')">ABBV</span>
+    <span class="chip" onclick="quickAdd('MU')">MU</span>
+    <span class="chip" onclick="quickAdd('LRCX')">LRCX</span>
+    <span class="chip" onclick="quickAdd('ANET')">ANET</span>
+    <span class="chip" onclick="quickAdd('APP')">APP</span>
+    <span class="chip" onclick="quickAdd('SMCI')">SMCI</span>
+    <span class="chip" onclick="quickAdd('MSTR')">MSTR</span>
+  </div>
+</div>
+
+<div id="controls">
+  <input type="text" id="search" placeholder="Filter by name or ticker…" oninput="renderTable()"/>
+  <select id="sectorsel" onchange="renderTable()"><option value="All">All Sectors</option></select>
+  <div class="tabgrp">
+    <button id="tab-all" class="active" onclick="setTab('all')">ALL</button>
+    <button id="tab-buy" onclick="setTab('buy')">BUY+</button>
+    <button id="tab-top" onclick="setTab('top')">TOP 10 UPSIDE</button>
+  </div>
+  <span id="count" style="color:#22d3ee;margin-left:auto"></span>
+</div>
+
+<div id="wrap">
+  <table>
+    <thead><tr id="thead"></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div id="empty" style="display:none;text-align:center;padding:60px;color:#334155;font-size:13px">
+    Watchlist empty. Add a ticker above.
+  </div>
+  <div style="padding:10px 20px;font-size:9px;color:#1e2535;border-top:1px solid #0a1020;margin-top:6px">
+    FOR RESEARCH PURPOSES ONLY. NOT FINANCIAL ADVICE.
+  </div>
+</div>
+
+<div id="modal-overlay" onclick="overlayClick(event)">
+  <div id="modal"><div id="modal-content"></div></div>
+</div>
+
+<div id="sbar">
+  <span id="sb-live" style="color:#fbbf24;font-weight:bold">⟳ Connecting…</span>
+  <span style="color:#06b6d4;font-weight:bold">⚡</span>
+  <span id="sb-top"></span>
+  <span style="color:#1e2535;margin-left:auto">NOT FINANCIAL ADVICE</span>
+</div>
+
+<script>
+const DEFAULT_TICKERS = [
+  "AAPL","MSFT","NVDA","AMZN","GOOGL","INTC","BABA","ORCL","ASML","TSM",
+  "AVGO","PANW","CRWD","STX","RYCEY","BWXT","CAT","ETN","VRT","PWR",
+  "SLB","CEG","EOG","ET","XOM","CCJ","VST","BE","XLU","NEE",
+  "HOOD","V","AXP","BRK-B","RKT","PEP","PG","COST","UNH","NVO",
+  "NFLX","ANF","WYNN","ULTA","ELF","STLA","VZ","TMUS","HD",
+  "LEN","TOL","KBH","DHI","AVUV"
+];
+
+const SAVE_KEY = "wl_v6";
+let watchlist = [];
+let sortCol = "score1y", sortDir = "desc", curTab = "all";
+
+function saveTickers(){ localStorage.setItem(SAVE_KEY, JSON.stringify(watchlist.map(w=>w.symbol))); }
+function loadTickers(){
+  try{ const s=JSON.parse(localStorage.getItem(SAVE_KEY)||"null"); return s&&s.length?s:DEFAULT_TICKERS; }
+  catch(e){ return DEFAULT_TICKERS; }
+}
+
+// ── SCORING ENGINE ──────────────────────────────────────
+const clamp = (v,a,b) => Math.min(b,Math.max(a,v));
+
+function buildScores(d){
+  const price=d.price, hi52=d.high52, lo52=d.low52, ma50=d.ma50, ma200=d.ma200;
+  const chg=d.changePct, recMean=d.recMean, pt=d.ptMean, ptHi=d.ptHigh;
+  const roe=d.roe, netMgn=d.netMgn, grossMgn=d.grossMgn;
+  const revGrow=d.revGrow, epsGrow=d.epsGrow, dteq=d.dteq;
+  const pe=d.pe, fpe=d.fpe;
+
+  const pos52 = (price&&hi52&&lo52&&hi52>lo52)?(price-lo52)/(hi52-lo52):0.5;
+  const analystUp = (price&&pt)?((pt-price)/price*100):null;
+  const aboveMa50  = price&&ma50 ?price>ma50 :null;
+  const aboveMa200 = price&&ma200?price>ma200:null;
+  // Yahoo recMean: 1=strong buy, 5=strong sell → flip: higher=better
+  const recS = recMean ? clamp(6-recMean,1,5) : 3;
+
+  // 1-MONTH
+  let s1m=5;
+  if(pos52>0.75) s1m+=1.2; else if(pos52>0.55) s1m+=0.5; else if(pos52<0.25) s1m+=0.3; else s1m-=0.2;
+  if(aboveMa50===true) s1m+=0.7; else if(aboveMa50===false) s1m-=0.7;
+  if(aboveMa200===true) s1m+=0.4; else if(aboveMa200===false) s1m-=0.4;
+  if(chg>3) s1m+=0.6; else if(chg>1) s1m+=0.3; else if(chg<-3) s1m-=0.6; else if(chg<-1) s1m-=0.2;
+  if(recS>=4.5) s1m+=0.8; else if(recS>=4) s1m+=0.4; else if(recS<2) s1m-=1; else if(recS<2.5) s1m-=0.5;
+  if(analystUp!=null){ if(analystUp>20) s1m+=0.4; else if(analystUp<0) s1m-=0.5; }
+  s1m=clamp(Math.round(s1m*10)/10,1,10);
+
+  // 1-YEAR
+  let s1y=5;
+  if(revGrow!=null){ if(revGrow>25) s1y+=1.8; else if(revGrow>12) s1y+=1; else if(revGrow>4) s1y+=0.5; else if(revGrow<0) s1y-=0.8; }
+  if(epsGrow!=null){ if(epsGrow>25) s1y+=0.8; else if(epsGrow>10) s1y+=0.5; else if(epsGrow<-10) s1y-=0.8; else if(epsGrow<0) s1y-=0.3; }
+  if(netMgn!=null){ if(netMgn>25) s1y+=0.7; else if(netMgn>12) s1y+=0.4; else if(netMgn<0) s1y-=0.8; }
+  if(grossMgn!=null){ if(grossMgn>65) s1y+=0.4; else if(grossMgn>40) s1y+=0.2; }
+  if(recS>=4.5) s1y+=1; else if(recS>=4) s1y+=0.5; else if(recS<2) s1y-=1; else if(recS<2.5) s1y-=0.5;
+  if(analystUp!=null){ if(analystUp>40) s1y+=1.2; else if(analystUp>20) s1y+=0.7; else if(analystUp>5) s1y+=0.3; else if(analystUp<-5) s1y-=0.8; else if(analystUp<0) s1y-=0.4; }
+  if(fpe!=null&&fpe>0){ if(fpe<15) s1y+=0.5; else if(fpe>60) s1y-=0.5; }
+  s1y=clamp(Math.round(s1y*10)/10,1,10);
+
+  // 5-YEAR
+  let s5y=5;
+  if(roe!=null){ if(roe>30) s5y+=1.8; else if(roe>20) s5y+=1.2; else if(roe>10) s5y+=0.6; else if(roe<0) s5y-=1; }
+  if(grossMgn!=null){ if(grossMgn>70) s5y+=1.2; else if(grossMgn>50) s5y+=0.7; else if(grossMgn>35) s5y+=0.3; else if(grossMgn<15) s5y-=0.5; }
+  if(netMgn!=null){ if(netMgn>30) s5y+=1; else if(netMgn>18) s5y+=0.6; else if(netMgn>5) s5y+=0.2; else if(netMgn<0) s5y-=1.2; }
+  if(revGrow!=null){ if(revGrow>20) s5y+=0.8; else if(revGrow>8) s5y+=0.4; else if(revGrow<0) s5y-=0.5; }
+  if(dteq!=null){ if(dteq<0.3) s5y+=0.6; else if(dteq<1) s5y+=0.2; else if(dteq>3) s5y-=0.6; }
+  if(price&&ptHi){ const hu=((ptHi-price)/price*100); if(hu>100) s5y+=0.5; else if(hu>50) s5y+=0.3; else if(hu<10) s5y-=0.2; }
+  s5y=clamp(Math.round(s5y*10)/10,1,10);
+
+  const score=clamp(Math.round((s1m*0.2+s1y*0.5+s5y*0.3)*10)/10,1,10);
+  return {score1m:s1m, score1y:s1y, score5y:s5y, score, analystUp, recS, pos52, aboveMa50, aboveMa200};
+}
+
+// ── API CALL ─────────────────────────────────────────────
+async function apiFetch(symbols){
+  const url = `/api/quotes?symbols=${symbols.join(",")}`;
+  const r = await fetch(url, {signal: AbortSignal.timeout(120000)});
+  const json = await r.json();
+  return json.results || [];
+}
+
+// ── LOAD / REFRESH ────────────────────────────────────────
+async function loadAll(){
+  const btn=document.getElementById("refbtn");
+  btn.disabled=true; btn.textContent="⟳ Loading…";
+  showProg(true); setP(0);
+  document.getElementById("sb-live").textContent="⟳ Fetching live data…";
+  document.getElementById("sb-live").style.color="#fbbf24";
+
+  const tickers = loadTickers();
+  watchlist = tickers.map(t=>({symbol:t, name:t, price:null}));
+  renderTable();
+
+  // Fetch in batches of 10
+  const BATCH=10;
+  let done=0;
+  for(let i=0;i<tickers.length;i+=BATCH){
+    const batch=tickers.slice(i,i+BATCH);
+    try{
+      const results = await apiFetch(batch);
+      results.forEach(d=>{
+        const scores=buildScores(d);
+        const idx=watchlist.findIndex(w=>w.symbol===d.symbol);
+        const row={...d,...scores};
+        if(idx>=0) watchlist[idx]=row; else watchlist.push(row);
+      });
+    }catch(e){ console.warn("batch error",e); }
+    done+=batch.length;
+    setP(Math.min(100,Math.round(done/tickers.length*100)));
+    populateSectors(); renderTable(); renderSBar();
+    if(i+BATCH<tickers.length) await sleep(200);
+  }
+  finish();
+}
+
+async function refreshAll(){
+  const btn=document.getElementById("refbtn");
+  btn.disabled=true; btn.textContent="⟳ Refreshing…";
+  showProg(true); setP(0);
+  const tickers=watchlist.map(w=>w.symbol);
+  const BATCH=10; let done=0;
+  for(let i=0;i<tickers.length;i+=BATCH){
+    try{
+      const results=await apiFetch(tickers.slice(i,i+BATCH));
+      results.forEach(d=>{
+        const scores=buildScores(d);
+        const idx=watchlist.findIndex(w=>w.symbol===d.symbol);
+        if(idx>=0) watchlist[idx]={...watchlist[idx],...d,...scores};
+      });
+    }catch(e){}
+    done+=BATCH; setP(Math.min(100,Math.round(done/tickers.length*100)));
+    renderTable(); renderSBar();
+    if(i+BATCH<tickers.length) await sleep(200);
+  }
+  finish();
+}
+
+function finish(){
+  const now=new Date();
+  document.getElementById("hts").textContent=`● Live · Refreshed ${now.toLocaleTimeString()} · auto 90s`;
+  document.getElementById("sb-live").textContent=`● LIVE · ${now.toLocaleTimeString()}`;
+  document.getElementById("sb-live").style.color="#00ff88";
+  showProg(false);
+  const btn=document.getElementById("refbtn");
+  btn.disabled=false; btn.textContent="↻ REFRESH ALL";
+}
+
+// ── ADD / REMOVE ──────────────────────────────────────────
+async function addTicker(){
+  const inp=document.getElementById("tickerinput");
+  const sym=inp.value.trim().toUpperCase();
+  if(!sym){ setMsg("Enter a ticker.","#f87171"); return; }
+  if(watchlist.find(w=>w.symbol===sym)){ setMsg(sym+" already in watchlist.","#22d3ee"); inp.value=""; return; }
+  setMsg(`⟳ Fetching ${sym}…`,"#06b6d4");
+  document.getElementById("addbtn").disabled=true;
+  try{
+    const results=await apiFetch([sym]);
+    if(!results.length||!results[0].price){ setMsg(`"${sym}" not found.`,"#f87171"); return; }
+    const d=results[0]; const scores=buildScores(d);
+    watchlist.push({...d,...scores});
+    saveTickers(); populateSectors(); renderTable(); renderSBar();
+    setMsg(`✓ ${d.name} added!`,"#00ff88"); inp.value="";
+  }catch(e){ setMsg("Error: "+e.message,"#f87171"); }
+  finally{ document.getElementById("addbtn").disabled=false; }
+}
+
+function removeTicker(sym){
+  watchlist=watchlist.filter(w=>w.symbol!==sym);
+  saveTickers(); populateSectors(); renderTable(); renderSBar();
+}
+
+async function quickAdd(sym){ document.getElementById("tickerinput").value=sym; await addTicker(); }
+
+// ── TABLE ─────────────────────────────────────────────────
+const COLS=[
+  {k:"symbol",    lb:"TICKER"},
+  {k:"name",      lb:"COMPANY"},
+  {k:"sector",    lb:"SECTOR"},
+  {k:"price",     lb:"LIVE PRICE"},
+  {k:"changePct", lb:"DAY %"},
+  {k:"high52",    lb:"52W HIGH"},
+  {k:"low52",     lb:"52W LOW"},
+  {k:"ma50",      lb:"MA 50"},
+  {k:"ma200",     lb:"MA 200"},
+  {k:"ptMean",    lb:"ANALYST PT"},
+  {k:"analystUp", lb:"UPSIDE %"},
+  {k:"score1m",   lb:"1-MONTH"},
+  {k:"score1y",   lb:"1-YEAR"},
+  {k:"score5y",   lb:"5-YEAR"},
+  {k:"score",     lb:"COMPOSITE"},
+  {k:"pe",        lb:"P/E"},
+  {k:"roe",       lb:"ROE %"},
+  {k:"netMgn",    lb:"NET MARGIN"},
+  {k:"revGrow",   lb:"REV GROWTH"},
+  {k:"mktCap",    lb:"MKT CAP"},
+  {k:"actions",   lb:"ACTIONS"},
+];
+
+function doSort(k){ if(k==="actions")return; sortDir=sortCol===k?(sortDir==="desc"?"asc":"desc"):"desc"; sortCol=k; renderTable(); }
+function setTab(t){ curTab=t; document.querySelectorAll(".tabgrp button").forEach(b=>b.classList.remove("active")); document.getElementById("tab-"+t).classList.add("active"); renderTable(); }
+function populateSectors(){
+  const sel=document.getElementById("sectorsel"), cur=sel.value;
+  const secs=["All",...new Set(watchlist.map(w=>w.sector||"—").filter(s=>s!=="—"))].sort((a,b)=>a==="All"?-1:a.localeCompare(b));
+  sel.innerHTML=secs.map(s=>`<option value="${s}"${s===cur?" selected":""}>${s}</option>`).join("");
+}
+
+function renderTable(){
+  document.getElementById("thead").innerHTML=COLS.map(c=>{
+    if(c.k==="actions") return `<th>${c.lb}</th>`;
+    return `<th class="${sortCol===c.k?"sorted":""}" onclick="doSort('${c.k}')">${c.lb}${sortCol===c.k?(sortDir==="desc"?" ↓":" ↑"):""}</th>`;
+  }).join("");
+
+  const search=document.getElementById("search").value.toLowerCase();
+  const sector=document.getElementById("sectorsel").value;
+  let list=[...watchlist];
+  if(sector!=="All") list=list.filter(w=>w.sector===sector);
+  if(search) list=list.filter(w=>w.symbol.toLowerCase().includes(search)||(w.name||"").toLowerCase().includes(search));
+  if(curTab==="buy") list=list.filter(w=>w.score>=7.5);
+  if(curTab==="top") list=[...list].filter(w=>w.analystUp!=null).sort((a,b)=>(b.analystUp||0)-(a.analystUp||0)).slice(0,10);
+
+  list.sort((a,b)=>{
+    let av=a[sortCol],bv=b[sortCol];
+    if(typeof av==="string"&&typeof bv==="string") return sortDir==="asc"?av.localeCompare(bv):bv.localeCompare(av);
+    av=av??-9999; bv=bv??-9999;
+    return sortDir==="asc"?av-bv:bv-av;
+  });
+
+  document.getElementById("count").textContent=`${list.length} / ${watchlist.length}`;
+  document.getElementById("empty").style.display=watchlist.length===0?"block":"none";
+
+  const sc=s=>s>=8.5?"#00ff88":s>=7.5?"#22d3ee":s>=6.5?"#a3e635":s>=5.5?"#fbbf24":s>=4?"#fb923c":"#f87171";
+  const sb=s=>s>=8.5?"rgba(0,255,136,.09)":s>=7.5?"rgba(34,211,238,.09)":s>=6.5?"rgba(163,230,53,.07)":s>=5.5?"rgba(251,191,36,.07)":s>=4?"rgba(251,146,60,.07)":"rgba(248,113,113,.07)";
+  const vd=s=>s>=8.5?"STRONG BUY":s>=7.5?"BUY":s>=6.5?"WATCH+":s>=5.5?"WATCH":s>=4?"RISKY":"AVOID";
+
+  document.getElementById("tbody").innerHTML=list.map(s=>{
+    if(s.price==null) return `<tr><td style="color:#22d3ee;font-weight:bold">${s.symbol}</td><td colspan="19" style="color:#334155">⟳ Loading…</td><td><button class="abtn rm-btn" onclick="removeTicker('${s.symbol}')">✕</button></td></tr>`;
+    const sco=s.score||0;
+    const cc=s.changePct==null?"#475569":s.changePct>=0?"#22d3ee":"#f87171";
+    const uc=s.analystUp==null?"#475569":s.analystUp>=25?"#00ff88":s.analystUp>=10?"#a3e635":s.analystUp>=0?"#fbbf24":"#f87171";
+    const m50c=s.price&&s.ma50?(s.price>s.ma50?"#22d3ee":"#f87171"):"#475569";
+    const m200c=s.price&&s.ma200?(s.price>s.ma200?"#22d3ee":"#f87171"):"#475569";
+    return `<tr>
+      <td style="font-weight:bold;color:${sc(sco)};letter-spacing:.5px">${s.symbol}</td>
+      <td style="color:#94a3b8;font-size:11px;max-width:170px;overflow:hidden;text-overflow:ellipsis">${s.name||"—"}</td>
+      <td><span class="sbadge">${s.sector||"—"}</span></td>
+      <td style="color:#f1f5f9;font-weight:bold;font-size:14px">$${fmt(s.price)}</td>
+      <td style="color:${cc};font-weight:bold">${s.changePct!=null?(s.changePct>=0?"+":"")+fmt(s.changePct)+"%":"—"}</td>
+      <td style="color:#64748b">${s.high52?"$"+fmt(s.high52):"—"}</td>
+      <td style="color:#64748b">${s.low52?"$"+fmt(s.low52):"—"}</td>
+      <td style="color:${m50c}">${s.ma50?"$"+fmt(s.ma50):"—"}</td>
+      <td style="color:${m200c}">${s.ma200?"$"+fmt(s.ma200):"—"}</td>
+      <td style="color:#a3e635;font-weight:bold">${s.ptMean?"$"+fmt(s.ptMean):"—"}</td>
+      <td style="color:${uc};font-weight:bold">${s.analystUp!=null?(s.analystUp>=0?"+":"")+fmt(s.analystUp)+"%":"—"}</td>
+      <td>${pj(s.score1m,"1M")}</td>
+      <td>${pj(s.score1y,"1Y")}</td>
+      <td>${pj(s.score5y,"5Y")}</td>
+      <td><div class="sbox" style="background:${sb(sco)};border:1px solid ${sc(sco)}33;color:${sc(sco)}">${sco}</div></td>
+      <td style="color:${s.pe>0&&s.pe<20?"#a3e635":s.pe>50?"#fb923c":"#94a3b8"}">${s.pe!=null&&s.pe>0?fmt(s.pe,1)+"x":"—"}</td>
+      <td style="color:${s.roe>25?"#22d3ee":s.roe>12?"#a3e635":s.roe<0?"#f87171":"#94a3b8"}">${s.roe!=null?fmt(s.roe,1)+"%":"—"}</td>
+      <td style="color:${s.netMgn>20?"#22d3ee":s.netMgn>0?"#a3e635":"#f87171"}">${s.netMgn!=null?fmt(s.netMgn,1)+"%":"—"}</td>
+      <td style="color:${s.revGrow>15?"#22d3ee":s.revGrow>0?"#a3e635":s.revGrow<0?"#f87171":"#94a3b8"}">${s.revGrow!=null?(s.revGrow>=0?"+":"")+fmt(s.revGrow,1)+"%":"—"}</td>
+      <td style="color:#64748b;font-size:11px">${fmtCap(s.mktCap)}</td>
+      <td>
+        <button class="abtn an-btn" onclick="openModal('${s.symbol}')">⊕ ANALYZE</button>
+        <button class="abtn rm-btn" onclick="removeTicker('${s.symbol}')">✕</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function pj(score,label){
+  if(score==null) return `<span style="color:#334155">…</span>`;
+  const c=score>=8.5?"#00ff88":score>=7.5?"#22d3ee":score>=6.5?"#a3e635":score>=5.5?"#fbbf24":score>=4?"#fb923c":"#f87171";
+  return `<div class="pj"><span class="pj-s" style="color:${c}">${score}</span><span class="pj-l">${label}</span></div>`;
+}
+
+function renderSBar(){
+  const top=[...watchlist].filter(w=>w.score&&w.price).sort((a,b)=>b.score-a.score).slice(0,6);
+  const sc=s=>s>=8.5?"#00ff88":s>=7.5?"#22d3ee":s>=6.5?"#a3e635":"#fbbf24";
+  document.getElementById("sb-top").innerHTML=top.map(s=>
+    `<span style="color:${sc(s.score)};font-weight:bold">${s.symbol}</span> `+
+    `<span style="color:#e2e8f0">$${fmt(s.price)}</span>`+
+    (s.changePct!=null?` <span style="color:${s.changePct>=0?"#22d3ee":"#f87171"}">${s.changePct>=0?"(+":"("}${fmt(s.changePct)}%)</span>`:"")+
+    ` <span style="color:#1e2535"> | </span>`
+  ).join("");
+}
+
+// ── MODAL ─────────────────────────────────────────────────
+async function openModal(sym){
+  document.getElementById("modal-overlay").classList.add("open");
+  document.getElementById("modal-content").innerHTML=`<div class="mh"><div><div class="m-tick" style="color:#06b6d4">${sym}</div></div><button class="mclose" onclick="closeModal()">✕ CLOSE</button></div><div class="mb"><div class="loading-box"><div class="spin"></div><br><br>Fetching live data for ${sym}…</div></div>`;
+  try{
+    const results=await apiFetch([sym]);
+    if(!results.length){ document.getElementById("modal-content").innerHTML=`<div class="mh"><div class="m-tick">${sym}</div><button class="mclose" onclick="closeModal()">✕</button></div><div class="mb" style="color:#f87171;padding:30px">No data found.</div>`; return; }
+    const d=results[0]; const scores=buildScores(d); const full={...d,...scores};
+    const idx=watchlist.findIndex(w=>w.symbol===sym);
+    if(idx>=0) watchlist[idx]={...watchlist[idx],...full};
+    renderModal(full); renderTable();
+  }catch(e){ console.error(e); }
+}
+
+function renderModal(d){
+  const sc=s=>s>=8.5?"#00ff88":s>=7.5?"#22d3ee":s>=6.5?"#a3e635":s>=5.5?"#fbbf24":s>=4?"#fb923c":"#f87171";
+  const vd=s=>s>=8.5?"STRONG BUY":s>=7.5?"BUY":s>=6.5?"WATCH+":s>=5.5?"WATCH":s>=4?"RISKY":"AVOID";
+  const p=d.price||0;
+  const t1m=p>0?"$"+(p*(1+(d.score1m-5)*0.018)).toFixed(2):"—";
+  const t1y=d.ptMean?"$"+fmt(d.ptMean):(p>0?"$"+(p*(1+(d.score1y-5)*0.12)).toFixed(2):"—");
+  const t5y=p>0?"$"+(p*Math.pow(1+(d.score5y-5)*0.09,5)).toFixed(2):"—";
+  const cc=d.changePct>=0?"#22d3ee":"#f87171";
+  const recTxt=d.recMean?(d.recMean<1.5?"STRONG BUY":d.recMean<2.5?"BUY":d.recMean<3.5?"HOLD":d.recMean<4.5?"SELL":"STRONG SELL"):"—";
+
+  // rationale builders
+  const w1m=()=>{const p=[];if(d.pos52>0.75)p.push("Near 52W high — strong momentum.");else if(d.pos52<0.25)p.push("Near 52W low — oversold.");if(d.aboveMa50===true)p.push("Above 50-day MA — bullish trend.");else if(d.aboveMa50===false)p.push("Below 50-day MA — bearish.");if(d.changePct>2)p.push("Strong positive day.");else if(d.changePct<-2)p.push("Negative day momentum.");return p.slice(0,3).join(" ")||"Based on technical price action."};
+  const w1y=()=>{const p=[];if(d.revGrow!=null)p.push(d.revGrow>15?`Rev +${d.revGrow.toFixed(0)}% YoY — strong.`:d.revGrow>0?`Rev +${d.revGrow.toFixed(0)}% YoY.`:"Revenue declining.");if(d.netMgn!=null&&d.netMgn>15)p.push(`Net margin ${d.netMgn.toFixed(1)}%.`);if(d.analystUp!=null)p.push(d.analystUp>15?`Analysts see +${d.analystUp.toFixed(0)}% upside.`:d.analystUp<0?"PT below price — caution.":"");return p.filter(Boolean).slice(0,3).join(" ")||"Analyst targets + fundamental growth.";};
+  const w5y=()=>{const p=[];if(d.roe!=null)p.push(d.roe>25?`ROE ${d.roe.toFixed(1)}% — strong moat.`:d.roe>12?`ROE ${d.roe.toFixed(1)}%.`:d.roe<0?"Negative ROE — concern.":"");if(d.grossMgn!=null&&d.grossMgn>50)p.push(`Gross margin ${d.grossMgn.toFixed(0)}% — pricing power.`);if(d.dteq!=null)p.push(d.dteq<0.5?"Clean balance sheet.":d.dteq>3?"High leverage — risk.":"");return p.filter(Boolean).slice(0,3).join(" ")||"ROE, margins, and balance sheet durability.";};
+
+  document.getElementById("modal-content").innerHTML=`
+  <div class="mh">
+    <div><div class="m-tick" style="color:${sc(d.score)}">${d.symbol}</div><div class="m-name">${d.name}</div><div class="m-meta">${d.sector} · ${d.currency||"USD"} · Cap: ${fmtCap(d.mktCap)} · ${d.analystN||0} analysts</div></div>
+    <div style="display:flex;gap:12px;align-items:flex-start">
+      <div style="text-align:right"><div class="m-price">$${fmt(d.price)}</div><div class="m-chg" style="color:${cc}">${d.changePct!=null?(d.changePct>=0?"+":"")+fmt(d.changePct)+"%":"—"} today</div><div style="font-size:10px;color:#475569;margin-top:2px">H: $${fmt(d.dayHigh)} · L: $${fmt(d.dayLow)}</div></div>
+      <button class="mclose" onclick="closeModal()">✕</button>
+    </div>
+  </div>
+  <div class="mb">
+    <div class="ms"><h3>MULTI-HORIZON PROJECTION SCORES — LIVE YAHOO FINANCE DATA</h3>
+      <div class="pc-row">
+        ${pc("1-MONTH OUTLOOK",d.score1m,t1m,w1m(),"Momentum, MA trends, analyst sentiment")}
+        ${pc("1-YEAR OUTLOOK",d.score1y,t1y,w1y(),"Revenue/EPS growth, analyst targets, margins")}
+        ${pc("5-YEAR OUTLOOK",d.score5y,t5y,w5y(),"ROE, gross margins, balance sheet, moat")}
+      </div>
+    </div>
+    <div class="ms"><h3>LIVE FUNDAMENTALS</h3><div class="mg">
+      ${mi("Live Price","$"+fmt(d.price),"#f1f5f9")}
+      ${mi("Day Change",d.changePct!=null?(d.changePct>=0?"+":"")+fmt(d.changePct)+"%":"—",cc)}
+      ${mi("52W High",d.high52?"$"+fmt(d.high52):"—")}${mi("52W Low",d.low52?"$"+fmt(d.low52):"—")}
+      ${mi("50-Day MA",d.ma50?"$"+fmt(d.ma50):"—",d.price&&d.ma50?(d.price>d.ma50?"#22d3ee":"#f87171"):"#e2e8f0")}
+      ${mi("200-Day MA",d.ma200?"$"+fmt(d.ma200):"—",d.price&&d.ma200?(d.price>d.ma200?"#22d3ee":"#f87171"):"#e2e8f0")}
+      ${mi("Analyst PT",d.ptMean?"$"+fmt(d.ptMean):"—","#a3e635")}
+      ${mi("PT High",d.ptHigh?"$"+fmt(d.ptHigh):"—")}
+      ${mi("Upside to PT",d.analystUp!=null?(d.analystUp>=0?"+":"")+fmt(d.analystUp)+"%":"—",d.analystUp>15?"#00ff88":d.analystUp>0?"#a3e635":"#f87171")}
+      ${mi("Trailing P/E",d.pe!=null&&d.pe>0?fmt(d.pe,1)+"x":"—",d.pe>0&&d.pe<20?"#a3e635":d.pe>60?"#fb923c":"#e2e8f0")}
+      ${mi("Forward P/E",d.fpe!=null&&d.fpe>0?fmt(d.fpe,1)+"x":"—")}
+      ${mi("P/Book",d.pb!=null?fmt(d.pb,2)+"x":"—")}
+      ${mi("EPS TTM",d.eps?"$"+fmt(d.eps):"—")}${mi("EPS Fwd",d.epsF?"$"+fmt(d.epsF):"—")}
+      ${mi("ROE",d.roe!=null?fmt(d.roe,1)+"%":"—",d.roe>25?"#22d3ee":d.roe>12?"#a3e635":d.roe<0?"#f87171":"#e2e8f0")}
+      ${mi("Gross Margin",d.grossMgn!=null?fmt(d.grossMgn,1)+"%":"—",d.grossMgn>60?"#22d3ee":d.grossMgn>40?"#a3e635":"#e2e8f0")}
+      ${mi("Net Margin",d.netMgn!=null?fmt(d.netMgn,1)+"%":"—",d.netMgn>20?"#22d3ee":d.netMgn>0?"#a3e635":"#f87171")}
+      ${mi("Rev Growth",d.revGrow!=null?(d.revGrow>=0?"+":"")+fmt(d.revGrow,1)+"%":"—",d.revGrow>15?"#22d3ee":d.revGrow>0?"#a3e635":"#f87171")}
+      ${mi("EPS Growth",d.epsGrow!=null?(d.epsGrow>=0?"+":"")+fmt(d.epsGrow,1)+"%":"—")}
+      ${mi("Debt/Equity",d.dteq!=null?fmt(d.dteq,2)+"x":"—",d.dteq<0.5?"#a3e635":d.dteq>3?"#f87171":"#e2e8f0")}
+      ${mi("Beta",d.beta!=null?fmt(d.beta,2):"—")}
+      ${mi("Short %",d.shortPct!=null?fmt(d.shortPct,1)+"%":"—",d.shortPct>10?"#f87171":d.shortPct>5?"#fb923c":"#e2e8f0")}
+      ${mi("Div Yield",d.divYield!=null?fmt(d.divYield,2)+"%":"—","#a3e635")}
+      ${mi("Mkt Cap",fmtCap(d.mktCap))}
+    </div></div>
+    <div class="ms"><h3>SIGNAL SUMMARY</h3><div class="sg">
+      ${si("Composite",d.score+"/10",sc(d.score))}${si("1-Month",d.score1m+"/10",sc(d.score1m))}
+      ${si("1-Year",d.score1y+"/10",sc(d.score1y))}${si("5-Year",d.score5y+"/10",sc(d.score5y))}
+      ${si("Verdict",vd(d.score),sc(d.score))}${si("Analyst Rating",recTxt,d.recMean<2?"#00ff88":d.recMean<3?"#22d3ee":d.recMean>4?"#f87171":"#fbbf24")}
+      ${si("Above 50MA",d.price&&d.ma50?(d.price>d.ma50?"YES ▲":"NO ▼"):"—",d.price&&d.ma50?(d.price>d.ma50?"#22d3ee":"#f87171"):"#475569")}
+      ${si("Above 200MA",d.price&&d.ma200?(d.price>d.ma200?"YES ▲":"NO ▼"):"—",d.price&&d.ma200?(d.price>d.ma200?"#22d3ee":"#f87171"):"#475569")}
+      ${si("52W Position",d.pos52!=null?((d.pos52*100).toFixed(0)+"% of range"):"—",d.pos52>0.7?"#a3e635":d.pos52<0.3?"#22d3ee":"#fbbf24")}
+    </div></div>
+  </div>`;
+}
+
+function pc(label,score,target,why,sub){
+  if(score==null) return `<div class="pc"><div class="pc-lbl">${label}</div><div style="color:#334155;padding:20px 0">No data</div></div>`;
+  const sc=score>=8.5?"#00ff88":score>=7.5?"#22d3ee":score>=6.5?"#a3e635":score>=5.5?"#fbbf24":score>=4?"#fb923c":"#f87171";
+  const vd=score>=8.5?"STRONG BUY":score>=7.5?"BUY":score>=6.5?"WATCH+":score>=5.5?"WATCH":score>=4?"RISKY":"AVOID";
+  return `<div class="pc" style="border:1px solid ${sc}55"><div class="pc-lbl">${label}</div><div class="pc-num" style="color:${sc}">${score}</div><div class="pc-verd" style="color:${sc}">${vd}</div><div class="pc-tgt">Est. target: <strong style="color:#a3e635">${target}</strong></div><div class="pc-why">${why}</div><div style="font-size:9px;color:#334155;margin-top:5px">${sub}</div></div>`;
+}
+function mi(k,v,c="#e2e8f0"){ return `<div class="mi"><div class="mi-k">${k}</div><div class="mi-v" style="color:${c}">${v}</div></div>`; }
+function si(k,v,c="#e2e8f0"){ return `<div class="si"><span class="si-k">${k}</span><span class="si-v" style="color:${c}">${v}</span></div>`; }
+
+function overlayClick(e){ if(e.target===document.getElementById("modal-overlay"))closeModal(); }
+function closeModal(){ document.getElementById("modal-overlay").classList.remove("open"); }
+
+// ── UTILS ─────────────────────────────────────────────────
+const fmt     = (n,d=2)=>n!=null&&!isNaN(n)?Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):"—";
+const fmtCap  = n=>!n?"—":n>=1e12?"$"+(n/1e12).toFixed(2)+"T":n>=1e9?"$"+(n/1e9).toFixed(2)+"B":n>=1e6?"$"+(n/1e6).toFixed(1)+"M":"$"+n.toLocaleString();
+const sleep   = ms=>new Promise(r=>setTimeout(r,ms));
+const showProg= v=>document.getElementById("progbar").style.display=v?"block":"none";
+const setP    = p=>document.getElementById("progfill").style.width=p+"%";
+function setMsg(t,c="#fbbf24"){ const el=document.getElementById("addmsg"); el.textContent=t; el.style.color=c; if(t) setTimeout(()=>{if(el.textContent===t)el.textContent=""},5000); }
+
+setInterval(refreshAll, 90000);
+window.onload=()=>{
+  document.getElementById("hdate").textContent=new Date().toLocaleDateString("en-US",{weekday:"short",year:"numeric",month:"short",day:"numeric"}).toUpperCase();
+  renderTable();
+  loadAll();
+};
+</script>
+</body>
+</html>"""
+
+# ─────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("localhost", PORT), Handler)
+
+    print(f"""
+╔══════════════════════════════════════════════════════════╗
+║   LIVE WATCHLIST TERMINAL                                ║
+╠══════════════════════════════════════════════════════════╣
+║   Server running at:  http://localhost:{PORT}              ║
+║                                                          ║
+║   Open your browser and go to:                           ║
+║   ➜  http://localhost:{PORT}                               ║
+║                                                          ║
+║   Press Ctrl+C to stop the server.                       ║
+╚══════════════════════════════════════════════════════════╝
+""")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\nServer stopped.")
+        server.server_close()
